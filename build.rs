@@ -84,6 +84,7 @@ struct CachedBuildData {
     last_manifest_version: String,
     dim_perk_mappings: Vec<(u32, u32)>,
     procedural_intrinsic_mappings: Vec<(u32, u32)>,
+    legacy_catalyst_mappings: Vec<(u32, u32)>,
 
     perk_timestamps: BTreeMap<u64, u64>,
     #[serde(skip_serializing, default)]
@@ -96,11 +97,13 @@ impl CachedBuildData {
             && !self.dim_perk_mappings.is_empty()
             && !self.procedural_intrinsic_mappings.is_empty()
             && !self.perk_timestamps.is_empty()
+            && !self.legacy_catalyst_mappings.is_empty()
     }
 
     fn sort(&mut self) {
         self.dim_perk_mappings.sort();
         self.procedural_intrinsic_mappings.sort();
+        self.legacy_catalyst_mappings.sort();
     }
 
     fn clean_timestamps(&mut self) {
@@ -201,7 +204,7 @@ fn main() {
         }
     }
 
-    construct_enhance_perk_mapping(&mut formula_file, &mut cached_data);
+    construct_manifest_perk_mappings(&mut formula_file, &mut cached_data);
     construct_weapon_formulas(&mut formula_file, &mut cached_data);
 
     cached_data.clean_timestamps();
@@ -386,7 +389,7 @@ fn construct_weapon_formulas(formula_file: &mut File, cached: &mut CachedBuildDa
     );
 }
 
-fn construct_enhance_perk_mapping(formula_file: &mut File, cached: &mut CachedBuildData) {
+fn construct_manifest_perk_mappings(formula_file: &mut File, cached: &mut CachedBuildData) {
     let ping = reqwest::blocking::get("https://www.bungie.net");
     let has_internet = if let Ok(ping) = ping {
         ping.status().is_success()
@@ -399,6 +402,7 @@ fn construct_enhance_perk_mapping(formula_file: &mut File, cached: &mut CachedBu
     }
 
     let mut perk_mappings: Vec<(u32, u32)> = Vec::new();
+    let mut catalyst_mappings: Vec<(u32, u32)> = Vec::new();
     if has_internet {
         let json_file = reqwest::blocking::get(
             "https://raw.githubusercontent.com/DestinyItemManager/d2-additional-info/master/output/trait-to-enhanced-trait.json");
@@ -456,6 +460,7 @@ fn construct_enhance_perk_mapping(formula_file: &mut File, cached: &mut CachedBu
             println!("cargo:warning=using cached manifest");
             let mut cached_manifest_mappings = cached.procedural_intrinsic_mappings.clone();
             perk_mappings.append(&mut cached_manifest_mappings);
+            catalyst_mappings.append(&mut cached.legacy_catalyst_mappings.clone());
         } else if !manifest_secured {
             panic!("cargo:warning=bungie manifest error, cached manifest not found");
         }
@@ -464,6 +469,7 @@ fn construct_enhance_perk_mapping(formula_file: &mut File, cached: &mut CachedBu
             if manifest_json["Response"]["version"] == cached.last_manifest_version {
                 let mut cached_manifest_mappings = cached.procedural_intrinsic_mappings.clone();
                 perk_mappings.append(&mut cached_manifest_mappings);
+                catalyst_mappings.append(&mut cached.legacy_catalyst_mappings.clone());
             } else {
                 cached.last_manifest_version = manifest_json["Response"]["version"]
                     .as_str()
@@ -481,39 +487,44 @@ fn construct_enhance_perk_mapping(formula_file: &mut File, cached: &mut CachedBu
                 ));
                 println!("cargo:warning=downloaded new manifest");
                 cached.procedural_intrinsic_mappings.clear();
+                cached.legacy_catalyst_mappings.clear();
                 let item_data_json: Value =
                     serde_json::from_str(&item_data_raw.unwrap().text().unwrap()).unwrap();
+                let mut plug_catalyst_mappings: BTreeMap<u64, (u32, u32)> = BTreeMap::new();
                 for (key, value) in item_data_json.as_object().unwrap() {
                     let hash = key.parse::<u32>().unwrap();
-                    //does value have a key called itemTypeDisplayName?
-                    if !value
-                        .as_object()
-                        .unwrap()
-                        .contains_key("itemTypeDisplayName")
-                    {
-                        continue;
+                    //does value have a key called itemTypeDisplayName containing "Intrinsic"?
+                    if value.as_object().unwrap().contains_key("itemTypeDisplayName") && value["itemTypeDisplayName"].as_str().unwrap().contains("Intrinsic") {
+                        let name = value["displayProperties"]["name"].as_str().unwrap();
+                        for id in INTRINSIC_MAP.keys() {
+                            let names = INTRINSIC_MAP.get(id).unwrap();
+                            if names.contains(&name) {
+                                perk_mappings.push((hash, *id));
+                                cached.procedural_intrinsic_mappings.push((hash, *id));
+                            }
+                        }
                     }
-                    if !value["itemTypeDisplayName"]
-                        .as_str()
-                        .unwrap()
-                        .contains("Intrinsic")
-                    {
-                        continue;
-                    }
-                    let name = value["displayProperties"]["name"].as_str().unwrap();
-                    for id in INTRINSIC_MAP.keys() {
-                        let names = INTRINSIC_MAP.get(id).unwrap();
-                        if names.contains(&name) {
-                            perk_mappings.push((hash, *id));
-                            cached.procedural_intrinsic_mappings.push((hash, *id));
+                    if value.as_object().unwrap().contains_key("itemType") && value.as_object().unwrap().contains_key("plug") {
+                        let plug = value["plug"].as_object().unwrap();
+                        let item_type = value["itemType"].as_u64().unwrap();
+                        let category_hash = plug["plugCategoryHash"].as_u64().unwrap();
+                        if item_type == 20 && plug["uiPlugLabel"] == "masterwork_interactable" {
+                            plug_catalyst_mappings.entry(category_hash).and_modify(|entry| *entry = (hash, entry.1)).or_insert((hash, 0));
+                        }
+                        if item_type == 19 && plug["uiPlugLabel"] == "masterwork" {
+                            plug_catalyst_mappings.entry(category_hash).and_modify(|entry| *entry = (entry.0, hash)).or_insert((0, hash));
                         }
                     }
                 }
+                plug_catalyst_mappings.retain(|_, v| v.0 != 0 && v.1 != 0);
+                catalyst_mappings.append(&mut plug_catalyst_mappings.values().cloned().collect());
+                cached.legacy_catalyst_mappings = catalyst_mappings.clone();
             }
         }
     } else {
         let mut cached_manifest_mappings = cached.procedural_intrinsic_mappings.clone();
         perk_mappings.append(&mut cached_manifest_mappings);
+        catalyst_mappings.append(&mut cached.legacy_catalyst_mappings.clone());
     }
     write_variable(
         formula_file,
@@ -521,6 +532,13 @@ fn construct_enhance_perk_mapping(formula_file: &mut File, cached: &mut CachedBu
         &format!("[(u32, u32); {}]", perk_mappings.len()),
         format!("{:?}", perk_mappings),
         "Mapping of enhanced perks and intrinsics to their base perk/intrinsic",
+    );
+    write_variable(
+        formula_file,
+        "LEGACY_CATALYST_MAPPING",
+        &format!("[(u32, u32); {}]", catalyst_mappings.len()),
+        format!("{:?}", catalyst_mappings),
+        "Mapping of legacy catalyst dummy plugs to updated catalyst plugs",
     );
 }
 
